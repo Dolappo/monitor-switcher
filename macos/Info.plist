@@ -8,6 +8,8 @@
     <string>com.torstudio.monitorswitcher</string>
     <key>CFBundleName</key>
     <string>Monitor Switcher</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleDisplayName</key>
     <string>Monitor Switcher</string>
     <key>CFBundleShortVersionString</key>
