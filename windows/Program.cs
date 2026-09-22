@@ -17,8 +17,9 @@ internal static class Program
 // ============================================================================
 // Config: loaded from %AppData%\MonitorSwitcher\config.json (created
 // automatically on first run with these defaults if missing). Edit that
-// file to change inputs or the toggle hotkey — no rebuild required. Values
-// must match the Mac side's config (see macos/Sources/MonitorSwitcher/main.swift).
+// file to change inputs, brightness/contrast presets, or hotkeys — no
+// rebuild required. Values must match the Mac side's config (see
+// macos/Sources/MonitorSwitcher/main.swift).
 // ============================================================================
 
 internal sealed class HotkeyConfig
@@ -32,6 +33,12 @@ internal sealed class AppConfig
     public byte DisplayPortInputCode { get; set; } = 0x0F; // 15 decimal (VESA default: DisplayPort-1)
     public byte HdmiInputCode { get; set; } = 0x11;         // 17 decimal (VESA default: HDMI-1)
     public HotkeyConfig ToggleHotkey { get; set; } = new HotkeyConfig();
+    public HotkeyConfig NightModeHotkey { get; set; } = new HotkeyConfig { Modifiers = new[] { "ctrl", "alt" }, Key = "n" };
+    public int DefaultLuminance { get; set; } = 75;
+    public int NightModeLuminance { get; set; } = 15;
+    public int LuminanceStep { get; set; } = 10;
+    public int DefaultContrast { get; set; } = 75;
+    public int ContrastStep { get; set; } = 10;
 
     private static string ConfigDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MonitorSwitcher");
@@ -72,6 +79,24 @@ internal sealed class AppConfig
     }
 }
 
+// ----------------------------------------------------------------------------
+// App-tracked "last known state" — separate from the user-editable config.
+// Windows' DDC API can technically read VCP values back, but many monitors
+// (including the one this app was built for) respond unreliably to "get" for
+// input/luminance/contrast. So exactly like the Mac side, we only ever WRITE
+// values via SetVCPFeature and remember what we last set here. It self-
+// corrects the next time you switch/adjust from this app.
+// ----------------------------------------------------------------------------
+
+internal sealed class StateData
+{
+    public int? LastInput { get; set; }
+    public int? CurrentLuminance { get; set; }
+    public int? CurrentContrast { get; set; }
+    public bool IsNightMode { get; set; }
+    public int? PreNightModeLuminance { get; set; }
+}
+
 internal static class AppState
 {
     private static string StateDir =>
@@ -79,33 +104,31 @@ internal static class AppState
 
     private static string StatePath => Path.Combine(StateDir, "state.json");
 
-    public static byte? LoadLastInput()
+    public static StateData Load()
     {
         try
         {
             if (File.Exists(StatePath))
             {
                 var json = File.ReadAllText(StatePath);
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("lastInput", out var el))
-                {
-                    return (byte)el.GetInt32();
-                }
+                var loaded = JsonSerializer.Deserialize<StateData>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (loaded != null) return loaded;
             }
         }
         catch
         {
-            // ignore, treated as unknown
+            // ignore, treated as unknown/defaults
         }
-        return null;
+        return new StateData();
     }
 
-    public static void SaveLastInput(byte input)
+    public static void Save(StateData state)
     {
         try
         {
             Directory.CreateDirectory(StateDir);
-            File.WriteAllText(StatePath, JsonSerializer.Serialize(new { lastInput = (int)input }));
+            File.WriteAllText(StatePath, JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch
         {
@@ -117,6 +140,7 @@ internal static class AppState
 internal sealed class TrayAppContext : ApplicationContext
 {
     private const int HOTKEY_ID_TOGGLE = 1;
+    private const int HOTKEY_ID_NIGHTMODE = 2;
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
     private const uint MOD_SHIFT = 0x0004;
@@ -124,36 +148,55 @@ internal sealed class TrayAppContext : ApplicationContext
     private const uint MOD_NOREPEAT = 0x4000;
     private const int WM_HOTKEY = 0x0312;
 
+    private const byte VCP_INPUT = 0x60;
+    private const byte VCP_LUMINANCE = 0x10;
+    private const byte VCP_CONTRAST = 0x12;
+
     private readonly AppConfig _config;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _displayPortItem;
     private readonly ToolStripMenuItem _hdmiItem;
+    private readonly ToolStripMenuItem _nightModeItem;
     private readonly List<PHYSICAL_MONITOR> _openMonitors = new();
     private readonly HotkeyWindow _hotkeyWindow;
 
-    // Best-effort tracked state: Windows' DDC API can technically read VCP
-    // values, but many monitors reply unreliably to "get" for the input-source
-    // feature specifically. We remember the last input THIS app switched to,
-    // matching the same approach as the Mac side. It self-corrects the next
-    // time you switch from here.
     private byte? _currentInput;
+    private int _currentLuminance;
+    private int _currentContrast;
+    private bool _isNightMode;
+    private int _preNightModeLuminance;
 
     public TrayAppContext()
     {
         _config = AppConfig.Load();
-        _currentInput = AppState.LoadLastInput();
+
+        var state = AppState.Load();
+        _currentInput = state.LastInput.HasValue ? (byte)state.LastInput.Value : (byte?)null;
+        _currentLuminance = state.CurrentLuminance ?? _config.DefaultLuminance;
+        _currentContrast = state.CurrentContrast ?? _config.DefaultContrast;
+        _isNightMode = state.IsNightMode;
+        _preNightModeLuminance = state.PreNightModeLuminance ?? _config.DefaultLuminance;
 
         _displayPortItem = new ToolStripMenuItem("Bring monitor to this Surface (DisplayPort)", null,
             (_, _) => SwitchInput(_config.DisplayPortInputCode));
         _hdmiItem = new ToolStripMenuItem("Send monitor to the Mac (HDMI)", null,
             (_, _) => SwitchInput(_config.HdmiInputCode));
+        _nightModeItem = new ToolStripMenuItem($"Night Mode ({HotkeyDisplayString(_config.NightModeHotkey)})", null,
+            (_, _) => ToggleNightMode());
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(_displayPortItem);
         menu.Items.Add(_hdmiItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem($"Toggle: {HotkeyDisplayString()}") { Enabled = false });
+        menu.Items.Add(new ToolStripMenuItem($"Toggle: {HotkeyDisplayString(_config.ToggleHotkey)}") { Enabled = false });
         menu.Items.Add(new ToolStripMenuItem("Open Config Folder", null, (_, _) => OpenConfigFolder()));
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("Brightness Up", null, (_, _) => BrightnessUp()));
+        menu.Items.Add(new ToolStripMenuItem("Brightness Down", null, (_, _) => BrightnessDown()));
+        menu.Items.Add(_nightModeItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("Contrast Up", null, (_, _) => ContrastUp()));
+        menu.Items.Add(new ToolStripMenuItem("Contrast Down", null, (_, _) => ContrastDown()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
 
@@ -172,13 +215,15 @@ internal sealed class TrayAppContext : ApplicationContext
         _hotkeyWindow.HotKeyPressed += id =>
         {
             if (id == HOTKEY_ID_TOGGLE) ToggleInput();
+            else if (id == HOTKEY_ID_NIGHTMODE) ToggleNightMode();
         };
-        RegisterToggleHotkey();
+        RegisterHotkey(_config.ToggleHotkey, HOTKEY_ID_TOGGLE);
+        RegisterHotkey(_config.NightModeHotkey, HOTKEY_ID_NIGHTMODE);
     }
 
-    private string HotkeyDisplayString()
+    private string HotkeyDisplayString(HotkeyConfig hk)
     {
-        var parts = _config.ToggleHotkey.Modifiers.Select(m => m.ToLowerInvariant() switch
+        var parts = hk.Modifiers.Select(m => m.ToLowerInvariant() switch
         {
             "ctrl" or "control" => "Ctrl",
             "alt" => "Alt",
@@ -186,14 +231,14 @@ internal sealed class TrayAppContext : ApplicationContext
             "win" or "windows" => "Win",
             _ => m
         }).ToList();
-        parts.Add(_config.ToggleHotkey.Key.ToUpperInvariant());
+        parts.Add(hk.Key.ToUpperInvariant());
         return string.Join("+", parts);
     }
 
-    private void RegisterToggleHotkey()
+    private void RegisterHotkey(HotkeyConfig hk, int id)
     {
         uint mods = MOD_NOREPEAT;
-        foreach (var m in _config.ToggleHotkey.Modifiers)
+        foreach (var m in hk.Modifiers)
         {
             mods |= m.ToLowerInvariant() switch
             {
@@ -204,9 +249,9 @@ internal sealed class TrayAppContext : ApplicationContext
                 _ => 0u
             };
         }
-        if (string.IsNullOrEmpty(_config.ToggleHotkey.Key)) return;
-        uint vk = char.ToUpperInvariant(_config.ToggleHotkey.Key[0]);
-        RegisterHotKey(_hotkeyWindow.Handle, HOTKEY_ID_TOGGLE, mods, vk);
+        if (string.IsNullOrEmpty(hk.Key)) return;
+        uint vk = char.ToUpperInvariant(hk.Key[0]);
+        RegisterHotKey(_hotkeyWindow.Handle, id, mods, vk);
     }
 
     private void ToggleInput()
@@ -219,6 +264,7 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         _displayPortItem.Checked = _currentInput == _config.DisplayPortInputCode;
         _hdmiItem.Checked = _currentInput == _config.HdmiInputCode;
+        _nightModeItem.Checked = _isNightMode;
     }
 
     private void OpenConfigFolder()
@@ -228,45 +274,170 @@ internal sealed class TrayAppContext : ApplicationContext
         System.Diagnostics.Process.Start("explorer.exe", dir);
     }
 
+    private void PersistState()
+    {
+        AppState.Save(new StateData
+        {
+            LastInput = _currentInput,
+            CurrentLuminance = _currentLuminance,
+            CurrentContrast = _currentContrast,
+            IsNightMode = _isNightMode,
+            PreNightModeLuminance = _preNightModeLuminance
+        });
+    }
+
     private void SwitchInput(byte inputCode)
+    {
+        bool ok = SetVcpFeature(VCP_INPUT, inputCode);
+        if (ok)
+        {
+            _currentInput = inputCode;
+            PersistState();
+            UpdateChecks();
+            var label = inputCode == _config.DisplayPortInputCode ? "DisplayPort"
+                : (inputCode == _config.HdmiInputCode ? "HDMI" : $"input {inputCode}");
+            PlayFeedback(success: true, label: $"Switched to {label}");
+        }
+        else
+        {
+            PlayFeedback(success: false,
+                label: "No monitor responded to the DDC/CI command. Check that DDC/CI is enabled in the monitor's OSD menu.");
+        }
+    }
+
+    private void BrightnessUp()
+    {
+        int value = Math.Min(100, _currentLuminance + _config.LuminanceStep);
+        if (SetVcpFeature(VCP_LUMINANCE, (uint)value))
+        {
+            _currentLuminance = value;
+            PersistState();
+            PlayFeedback(success: true, label: $"Brightness {value}%");
+        }
+        else
+        {
+            PlayFeedback(success: false, label: "Couldn't change brightness.");
+        }
+    }
+
+    private void BrightnessDown()
+    {
+        int value = Math.Max(0, _currentLuminance - _config.LuminanceStep);
+        if (SetVcpFeature(VCP_LUMINANCE, (uint)value))
+        {
+            _currentLuminance = value;
+            PersistState();
+            PlayFeedback(success: true, label: $"Brightness {value}%");
+        }
+        else
+        {
+            PlayFeedback(success: false, label: "Couldn't change brightness.");
+        }
+    }
+
+    private void ContrastUp()
+    {
+        int value = Math.Min(100, _currentContrast + _config.ContrastStep);
+        if (SetVcpFeature(VCP_CONTRAST, (uint)value))
+        {
+            _currentContrast = value;
+            PersistState();
+            PlayFeedback(success: true, label: $"Contrast {value}");
+        }
+        else
+        {
+            PlayFeedback(success: false, label: "Couldn't change contrast.");
+        }
+    }
+
+    private void ContrastDown()
+    {
+        int value = Math.Max(0, _currentContrast - _config.ContrastStep);
+        if (SetVcpFeature(VCP_CONTRAST, (uint)value))
+        {
+            _currentContrast = value;
+            PersistState();
+            PlayFeedback(success: true, label: $"Contrast {value}");
+        }
+        else
+        {
+            PlayFeedback(success: false, label: "Couldn't change contrast.");
+        }
+    }
+
+    private void ToggleNightMode()
+    {
+        if (_isNightMode)
+        {
+            int restore = _preNightModeLuminance;
+            if (SetVcpFeature(VCP_LUMINANCE, (uint)restore))
+            {
+                _currentLuminance = restore;
+                _isNightMode = false;
+                PersistState();
+                UpdateChecks();
+                PlayFeedback(success: true, label: $"Brightness {restore}%");
+            }
+            else
+            {
+                PlayFeedback(success: false, label: "Couldn't leave Night Mode.");
+            }
+        }
+        else
+        {
+            int toRestore = _currentLuminance;
+            if (SetVcpFeature(VCP_LUMINANCE, (uint)_config.NightModeLuminance))
+            {
+                _preNightModeLuminance = toRestore;
+                _currentLuminance = _config.NightModeLuminance;
+                _isNightMode = true;
+                PersistState();
+                UpdateChecks();
+                PlayFeedback(success: true, label: "Night Mode");
+            }
+            else
+            {
+                PlayFeedback(success: false, label: "Couldn't enter Night Mode.");
+            }
+        }
+    }
+
+    private bool SetVcpFeature(byte vcpCode, uint value)
     {
         bool anySucceeded = false;
         try
         {
             foreach (var handle in GetPhysicalMonitorHandles())
             {
-                if (Dxva2.SetVCPFeature(handle, 0x60, inputCode))
+                if (Dxva2.SetVCPFeature(handle, vcpCode, value))
                 {
                     anySucceeded = true;
                 }
             }
-
-            if (anySucceeded)
-            {
-                _currentInput = inputCode;
-                AppState.SaveLastInput(inputCode);
-                UpdateChecks();
-                System.Media.SystemSounds.Asterisk.Play();
-                var label = inputCode == _config.DisplayPortInputCode ? "DisplayPort"
-                    : (inputCode == _config.HdmiInputCode ? "HDMI" : $"input {inputCode}");
-                _trayIcon.ShowBalloonTip(1500, "Monitor Switcher", $"Switched to {label}", ToolTipIcon.None);
-            }
-            else
-            {
-                System.Media.SystemSounds.Hand.Play();
-                _trayIcon.ShowBalloonTip(3000, "Monitor Switcher",
-                    "No monitor responded to the DDC/CI command. Check that DDC/CI is enabled in the monitor's OSD menu.",
-                    ToolTipIcon.Warning);
-            }
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Couldn't switch input:\n{ex.Message}", "Monitor Switcher",
+            MessageBox.Show($"Couldn't send the DDC/CI command:\n{ex.Message}", "Monitor Switcher",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
             ReleaseAllPhysicalMonitors();
+        }
+        return anySucceeded;
+    }
+
+    private void PlayFeedback(bool success, string label)
+    {
+        if (success)
+        {
+            System.Media.SystemSounds.Asterisk.Play();
+            _trayIcon.ShowBalloonTip(1500, "Monitor Switcher", label, ToolTipIcon.None);
+        }
+        else
+        {
+            System.Media.SystemSounds.Hand.Play();
+            _trayIcon.ShowBalloonTip(3000, "Monitor Switcher", label, ToolTipIcon.Warning);
         }
     }
 

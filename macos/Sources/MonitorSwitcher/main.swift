@@ -4,8 +4,8 @@ import Carbon.HIToolbox
 // ============================================================================
 // Config: loaded from ~/Library/Application Support/MonitorSwitcher/config.json
 // (created automatically on first launch with these defaults if missing).
-// Edit that file to change inputs, display number, or the toggle hotkey —
-// no rebuild required.
+// Edit that file to change inputs, display number, brightness/contrast
+// presets, or hotkeys — no rebuild required.
 // ============================================================================
 
 struct HotkeyConfig: Codable {
@@ -18,12 +18,24 @@ struct AppConfig: Codable {
     var displayPortCode: Int
     var hdmiCode: Int
     var toggleHotkey: HotkeyConfig
+    var nightModeHotkey: HotkeyConfig
+    var defaultLuminance: Int
+    var nightModeLuminance: Int
+    var luminanceStep: Int
+    var defaultContrast: Int
+    var contrastStep: Int
 
     static let defaultConfig = AppConfig(
         displayNumber: 1,             // from `m1ddc display list` — change to match your setup
         displayPortCode: 15,          // VESA default: DisplayPort-1
         hdmiCode: 17,                 // VESA default: HDMI-1
-        toggleHotkey: HotkeyConfig(modifiers: ["cmd", "option"], key: "s")
+        toggleHotkey: HotkeyConfig(modifiers: ["cmd", "option"], key: "s"),
+        nightModeHotkey: HotkeyConfig(modifiers: ["cmd", "option"], key: "n"),
+        defaultLuminance: 75,         // assumed starting brightness (0-100) — the monitor can't be read back, see README
+        nightModeLuminance: 15,
+        luminanceStep: 10,
+        defaultContrast: 75,
+        contrastStep: 10
     )
 }
 
@@ -82,8 +94,10 @@ func fourCharCode(_ string: String) -> FourCharCode {
 private func hotKeyEventHandler(nextHandler: EventHandlerCallRef?, event: EventRef?, userData: UnsafeMutableRawPointer?) -> OSStatus {
     var hotKeyID = EventHotKeyID()
     GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
-    if hotKeyID.id == 1 {
-        AppDelegate.shared?.toggleInput()
+    switch hotKeyID.id {
+    case 1: AppDelegate.shared?.toggleInput()
+    case 2: AppDelegate.shared?.toggleNightMode()
+    default: break
     }
     return noErr
 }
@@ -94,16 +108,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var config: AppConfig!
     var hotKeyRefToggle: EventHotKeyRef?
+    var hotKeyRefNightMode: EventHotKeyRef?
+
     var displayPortMenuItem: NSMenuItem!
     var hdmiMenuItem: NSMenuItem!
+    var nightModeMenuItem: NSMenuItem!
 
-    // Best-effort tracked state: m1ddc has no "get input" command, so we can't
-    // truly read the monitor's current input. We remember the last input THIS
-    // app successfully switched to. It's accurate right after you use this
-    // app, and only goes stale if the other machine switches inputs first —
-    // it self-corrects the next time you switch from here.
+    // Best-effort tracked state: m1ddc can't reliably read input, luminance,
+    // or contrast back from this monitor, so every value here is "what this
+    // app last set it to," not a live read. See README for details.
     var currentInput: Int? {
         didSet { UserDefaults.standard.set(currentInput, forKey: "lastKnownInput") }
+    }
+    var currentLuminance: Int = 0 {
+        didSet { UserDefaults.standard.set(currentLuminance, forKey: "currentLuminance") }
+    }
+    var currentContrast: Int = 0 {
+        didSet { UserDefaults.standard.set(currentContrast, forKey: "currentContrast") }
+    }
+    var isNightMode: Bool = false {
+        didSet { UserDefaults.standard.set(isNightMode, forKey: "isNightMode") }
+    }
+    var preNightModeLuminance: Int = 0 {
+        didSet { UserDefaults.standard.set(preNightModeLuminance, forKey: "preNightModeLuminance") }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -111,13 +138,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory) // menu bar only, no Dock icon, no bundle/plist needed
 
         config = loadConfig()
-        currentInput = (UserDefaults.standard.object(forKey: "lastKnownInput") as? Int)
+        let defaults = UserDefaults.standard
+        currentInput = (defaults.object(forKey: "lastKnownInput") as? Int)
+        currentLuminance = defaults.object(forKey: "currentLuminance") as? Int ?? config.defaultLuminance
+        currentContrast = defaults.object(forKey: "currentContrast") as? Int ?? config.defaultContrast
+        isNightMode = defaults.bool(forKey: "isNightMode")
+        preNightModeLuminance = defaults.object(forKey: "preNightModeLuminance") as? Int ?? config.defaultLuminance
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.title = "⇄"
 
         buildMenu()
-        registerGlobalHotKey()
+        registerGlobalHotKeys()
     }
 
     func buildMenu() {
@@ -129,10 +161,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(hdmiMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        let toggleInfo = NSMenuItem(title: "Toggle: \(hotkeyDisplayString())", action: nil, keyEquivalent: "")
+        let toggleInfo = NSMenuItem(title: "Toggle: \(hotkeyString(config.toggleHotkey))", action: nil, keyEquivalent: "")
         toggleInfo.isEnabled = false
         menu.addItem(toggleInfo)
         menu.addItem(NSMenuItem(title: "Reveal Config File in Finder", action: #selector(revealConfig), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "Brightness Up", action: #selector(brightnessUp), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Brightness Down", action: #selector(brightnessDown), keyEquivalent: ""))
+        nightModeMenuItem = NSMenuItem(title: "Night Mode (\(hotkeyString(config.nightModeHotkey)))", action: #selector(toggleNightMode), keyEquivalent: "")
+        menu.addItem(nightModeMenuItem)
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "Contrast Up", action: #selector(contrastUp), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Contrast Down", action: #selector(contrastDown), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -143,10 +185,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func updateCheckmarks() {
         displayPortMenuItem.state = (currentInput == config.displayPortCode) ? .on : .off
         hdmiMenuItem.state = (currentInput == config.hdmiCode) ? .on : .off
+        nightModeMenuItem.state = isNightMode ? .on : .off
     }
 
-    func hotkeyDisplayString() -> String {
-        let symbols = config.toggleHotkey.modifiers.map { m -> String in
+    func hotkeyString(_ hk: HotkeyConfig) -> String {
+        let symbols = hk.modifiers.map { m -> String in
             switch m.lowercased() {
             case "cmd", "command": return "⌘"
             case "option", "alt": return "⌥"
@@ -155,51 +198,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default: return ""
             }
         }
-        return (symbols + [config.toggleHotkey.key.uppercased()]).joined()
+        return (symbols + [hk.key.uppercased()]).joined()
     }
 
-    func registerGlobalHotKey() {
+    func registerGlobalHotKeys() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), hotKeyEventHandler, 1, &eventType, nil, nil)
 
-        guard let keyCode = macVirtualKeycodes[config.toggleHotkey.key.lowercased()] else {
-            NSLog("MonitorSwitcher: unrecognized hotkey letter '\(config.toggleHotkey.key)' in config.json — hotkey disabled")
+        registerHotKey(config.toggleHotkey, id: 1, signature: "mnSW", ref: &hotKeyRefToggle)
+        registerHotKey(config.nightModeHotkey, id: 2, signature: "mnNM", ref: &hotKeyRefNightMode)
+    }
+
+    func registerHotKey(_ hk: HotkeyConfig, id: UInt32, signature: String, ref: inout EventHotKeyRef?) {
+        guard let keyCode = macVirtualKeycodes[hk.key.lowercased()] else {
+            NSLog("MonitorSwitcher: unrecognized hotkey letter '\(hk.key)' in config.json — that hotkey is disabled")
             return
         }
         var modifierMask: UInt32 = 0
-        for m in config.toggleHotkey.modifiers {
+        for m in hk.modifiers {
             modifierMask |= macModifierFlags[m.lowercased()] ?? 0
         }
-
-        let hotKeyID = EventHotKeyID(signature: fourCharCode("mnSW"), id: 1)
-        RegisterEventHotKey(keyCode, modifierMask, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRefToggle)
+        let hotKeyID = EventHotKeyID(signature: fourCharCode(signature), id: id)
+        RegisterEventHotKey(keyCode, modifierMask, hotKeyID, GetApplicationEventTarget(), 0, &ref)
     }
 
-    @objc func switchToDisplayPort() { runM1DDC(input: config.displayPortCode) }
-    @objc func switchToHDMI()        { runM1DDC(input: config.hdmiCode) }
+    @objc func switchToDisplayPort() { runM1DDCSet(feature: "input", value: config.displayPortCode) { self.currentInput = self.config.displayPortCode } }
+    @objc func switchToHDMI()        { runM1DDCSet(feature: "input", value: config.hdmiCode) { self.currentInput = self.config.hdmiCode } }
 
     @objc func toggleInput() {
         let target = (currentInput == config.displayPortCode) ? config.hdmiCode : config.displayPortCode
-        runM1DDC(input: target)
+        runM1DDCSet(feature: "input", value: target) { self.currentInput = target }
+    }
+
+    @objc func brightnessUp() {
+        let value = min(100, currentLuminance + config.luminanceStep)
+        runM1DDCSet(feature: "luminance", value: value, label: "\(value)%") { self.currentLuminance = value }
+    }
+
+    @objc func brightnessDown() {
+        let value = max(0, currentLuminance - config.luminanceStep)
+        runM1DDCSet(feature: "luminance", value: value, label: "\(value)%") { self.currentLuminance = value }
+    }
+
+    @objc func contrastUp() {
+        let value = min(100, currentContrast + config.contrastStep)
+        runM1DDCSet(feature: "contrast", value: value, label: "Contrast \(value)") { self.currentContrast = value }
+    }
+
+    @objc func contrastDown() {
+        let value = max(0, currentContrast - config.contrastStep)
+        runM1DDCSet(feature: "contrast", value: value, label: "Contrast \(value)") { self.currentContrast = value }
+    }
+
+    @objc func toggleNightMode() {
+        if isNightMode {
+            let restore = preNightModeLuminance
+            runM1DDCSet(feature: "luminance", value: restore, label: "\(restore)%") {
+                self.currentLuminance = restore
+                self.isNightMode = false
+                self.updateCheckmarks()
+            }
+        } else {
+            preNightModeLuminance = currentLuminance
+            runM1DDCSet(feature: "luminance", value: config.nightModeLuminance, label: "Night") {
+                self.currentLuminance = self.config.nightModeLuminance
+                self.isNightMode = true
+                self.updateCheckmarks()
+            }
+        }
     }
 
     @objc func revealConfig() {
         NSWorkspace.shared.activateFileViewerSelecting([configFileURL()])
     }
 
-    func runM1DDC(input: Int) {
+    /// Runs `m1ddc display N set <feature> <value>`, and on success updates
+    /// app state via `onSuccess`, refreshes checkmarks, and plays feedback.
+    func runM1DDCSet(feature: String, value: Int, label: String? = nil, onSuccess: @escaping () -> Void) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: M1DDC_PATH)
-        task.arguments = ["display", "\(config.displayNumber)", "set", "input", "\(input)"]
+        task.arguments = ["display", "\(config.displayNumber)", "set", feature, "\(value)"]
         do {
             try task.run()
             task.waitUntilExit()
             if task.terminationStatus == 0 {
-                currentInput = input
+                onSuccess()
                 updateCheckmarks()
-                playFeedback(success: true, input: input)
+                playFeedback(success: true, label: label ?? inputLabel(for: value))
             } else {
-                playFeedback(success: false, input: input)
+                playFeedback(success: false, label: nil)
             }
         } catch {
             let alert = NSAlert()
@@ -209,10 +296,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func playFeedback(success: Bool, input: Int) {
+    func inputLabel(for value: Int) -> String {
+        if value == config.displayPortCode { return "DP" }
+        if value == config.hdmiCode { return "HDMI" }
+        return "\(value)"
+    }
+
+    func playFeedback(success: Bool, label: String?) {
         NSSound(named: success ? "Pop" : "Basso")?.play()
-        let label = (input == config.displayPortCode) ? "DP" : (input == config.hdmiCode ? "HDMI" : "\(input)")
-        statusItem.button?.title = success ? "✓ \(label)" : "✗"
+        statusItem.button?.title = success ? "✓ \(label ?? "")" : "✗"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             self?.statusItem.button?.title = "⇄"
         }
