@@ -15,43 +15,35 @@ DDC/CI generally only works over the *currently active* input, so there's no sin
 
 ## Before you build: find your monitor's real input codes
 
-The VESA defaults (DisplayPort-1 = `15`, HDMI-1 = `17`) work for many monitors, but not all. On a Mac with `m1ddc` installed:
+The VESA defaults (DisplayPort-1 = 15, HDMI-1 = 17) work for many monitors, but not all. On a Mac with `m1ddc` installed, run:
 
-```
-m1ddc display list                     # find your display's number
-m1ddc display <N> set input 15         # test — does this go to DisplayPort?
-m1ddc display <N> set input 17         # test — does this go to HDMI?
-```
+    m1ddc display list
+    m1ddc display N set input 15
+    m1ddc display N set input 17
 
-Try `16`/`18` (Displayport-2/HDMI-2) or `3`/`4` (DVI-1/2) if those don't match. Once confirmed, both projects need the same two numbers — see the CONFIG comments at the top of each entry point.
+(replace N with your display's number from the first command). Watch the monitor to confirm which number is which. Try 16/18 (DisplayPort-2/HDMI-2) or 3/4 (DVI-1/2) if those don't match. Once confirmed, both projects need the same two numbers — see the CONFIG comments at the top of each entry point.
 
 ## macOS
 
 See [`macos/`](./macos). Requires Xcode Command Line Tools and Homebrew.
 
-```
-brew install m1ddc
-cd macos
-# edit the three CONFIG constants at the top of Sources/MonitorSwitcher/main.swift
-#   (DISPLAY_NUMBER, DISPLAYPORT_INPUT_CODE, HDMI_INPUT_CODE) to match your setup
-env -u TOOLCHAINS xcrun swift build -c release
-./build_app.sh
-mv MonitorSwitcher.app /Applications/
-```
+Install m1ddc, then from the `macos` folder: edit the three CONFIG constants at the top of `Sources/MonitorSwitcher/main.swift` (`DISPLAY_NUMBER`, `DISPLAYPORT_INPUT_CODE`, `HDMI_INPUT_CODE`) to match your setup, then build with:
 
-Launch it from Applications. A "⇄" menu bar icon appears with two menu items, plus global hotkeys **⌘⌥D** (send to DisplayPort) and **⌘⌥H** (send to HDMI) — edit `HOTKEY_DISPLAYPORT_KEYCODE` / `HOTKEY_HDMI_KEYCODE` / `HOTKEY_MODIFIERS` in `main.swift` to change them.
+    env -u TOOLCHAINS xcrun swift build -c release
+    ./build_app.sh
+    mv MonitorSwitcher.app /Applications/
 
-To launch at login: System Settings → General → Login Items → add `MonitorSwitcher.app`.
+Launch it from Applications. A "⇄" menu bar icon appears with two menu items, plus global hotkeys Cmd+Option+D (send to DisplayPort) and Cmd+Option+H (send to HDMI) — edit `HOTKEY_DISPLAYPORT_KEYCODE` / `HOTKEY_HDMI_KEYCODE` / `HOTKEY_MODIFIERS` in `main.swift` to change them.
+
+To launch at login: System Settings, General, Login Items, add MonitorSwitcher.app.
 
 ## Windows
 
 See [`windows/`](./windows). Requires the .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`).
 
-```
-cd windows
-# edit the two CONFIG constants at the top of Program.cs to match your setup
-dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
-```
+From the `windows` folder: edit the two CONFIG constants at the top of `Program.cs` to match your setup, then build with:
+
+    dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 
 Run `publish\MonitorSwitcher.exe` — a tray icon appears with the same two actions. To launch at login, drop a shortcut to it in `shell:startup`.
 
