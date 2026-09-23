@@ -4,8 +4,9 @@ import Carbon.HIToolbox
 // ============================================================================
 // Config: loaded from ~/Library/Application Support/MonitorSwitcher/config.json
 // (created automatically on first launch with these defaults if missing).
-// Edit that file to change inputs, display number, brightness/contrast
-// presets, or hotkeys — no rebuild required.
+// Edit that file to change inputs, display number, contrast preset, or
+// hotkeys — no rebuild required. Brightness is controlled with a slider in
+// the menu, so it isn't step-configured like contrast is.
 // ============================================================================
 
 struct HotkeyConfig: Codable {
@@ -21,7 +22,6 @@ struct AppConfig: Codable {
     var nightModeHotkey: HotkeyConfig
     var defaultLuminance: Int
     var nightModeLuminance: Int
-    var luminanceStep: Int
     var defaultContrast: Int
     var contrastStep: Int
 
@@ -33,7 +33,6 @@ struct AppConfig: Codable {
         nightModeHotkey: HotkeyConfig(modifiers: ["cmd", "option"], key: "n"),
         defaultLuminance: 75,         // assumed starting brightness (0-100) — the monitor can't be read back, see README
         nightModeLuminance: 15,
-        luminanceStep: 10,
         defaultContrast: 75,
         contrastStep: 10
     )
@@ -113,6 +112,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var displayPortMenuItem: NSMenuItem!
     var hdmiMenuItem: NSMenuItem!
     var nightModeMenuItem: NSMenuItem!
+    var brightnessLabelItem: NSMenuItem!
+    var brightnessSlider: NSSlider!
+    var brightnessDebounceTimer: Timer?
 
     // Best-effort tracked state: m1ddc can't reliably read input, luminance,
     // or contrast back from this monitor, so every value here is "what this
@@ -167,8 +169,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Reveal Config File in Finder", action: #selector(revealConfig), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
-        menu.addItem(NSMenuItem(title: "Brightness Up", action: #selector(brightnessUp), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Brightness Down", action: #selector(brightnessDown), keyEquivalent: ""))
+        brightnessLabelItem = NSMenuItem(title: "Brightness: \(currentLuminance)%", action: nil, keyEquivalent: "")
+        brightnessLabelItem.isEnabled = false
+        menu.addItem(brightnessLabelItem)
+        let (sliderItem, slider) = makeSliderMenuItem(value: currentLuminance, action: #selector(brightnessSliderChanged(_:)))
+        brightnessSlider = slider
+        menu.addItem(sliderItem)
+
         nightModeMenuItem = NSMenuItem(title: "Night Mode (\(hotkeyString(config.nightModeHotkey)))", action: #selector(toggleNightMode), keyEquivalent: "")
         menu.addItem(nightModeMenuItem)
         menu.addItem(NSMenuItem.separator())
@@ -182,10 +189,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateCheckmarks()
     }
 
+    /// Builds a slider embedded directly in an NSMenuItem's custom view — the
+    /// same pattern macOS's own Control Center brightness slider uses. The
+    /// menu doesn't auto-close while you drag it.
+    func makeSliderMenuItem(value: Int, action: Selector) -> (NSMenuItem, NSSlider) {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        let slider = NSSlider(frame: NSRect(x: 20, y: 2, width: 200, height: 20))
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.integerValue = value
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = action
+        container.addSubview(slider)
+        let item = NSMenuItem()
+        item.view = container
+        return (item, slider)
+    }
+
     func updateCheckmarks() {
         displayPortMenuItem.state = (currentInput == config.displayPortCode) ? .on : .off
         hdmiMenuItem.state = (currentInput == config.hdmiCode) ? .on : .off
         nightModeMenuItem.state = isNightMode ? .on : .off
+        brightnessLabelItem.title = "Brightness: \(currentLuminance)%"
+        brightnessSlider.integerValue = currentLuminance
     }
 
     func hotkeyString(_ hk: HotkeyConfig) -> String {
@@ -230,14 +257,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runM1DDCSet(feature: "input", value: target) { self.currentInput = target }
     }
 
-    @objc func brightnessUp() {
-        let value = min(100, currentLuminance + config.luminanceStep)
-        runM1DDCSet(feature: "luminance", value: value, label: "\(value)%") { self.currentLuminance = value }
+    /// Live-updates the label as you drag, but only actually sends the DDC
+    /// command ~150ms after you pause — sliding smoothly to a value fires
+    /// m1ddc once, not on every pixel of drag.
+    @objc func brightnessSliderChanged(_ sender: NSSlider) {
+        let value = sender.integerValue
+        brightnessLabelItem.title = "Brightness: \(value)%"
+        brightnessDebounceTimer?.invalidate()
+        brightnessDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+            self?.applyBrightness(value)
+        }
     }
 
-    @objc func brightnessDown() {
-        let value = max(0, currentLuminance - config.luminanceStep)
-        runM1DDCSet(feature: "luminance", value: value, label: "\(value)%") { self.currentLuminance = value }
+    func applyBrightness(_ value: Int) {
+        runM1DDCSet(feature: "luminance", value: value, label: "\(value)%") { [weak self] in
+            self?.currentLuminance = value
+        }
     }
 
     @objc func contrastUp() {
