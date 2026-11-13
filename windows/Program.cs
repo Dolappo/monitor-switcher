@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace MonitorSwitcher;
 
@@ -17,9 +18,11 @@ internal static class Program
 // ============================================================================
 // Config: loaded from %AppData%\MonitorSwitcher\config.json (created
 // automatically on first run with these defaults if missing). Edit that
-// file to change inputs, brightness/contrast presets, or hotkeys — no
-// rebuild required. Values must match the Mac side's config (see
-// macos/Sources/MonitorSwitcher/main.swift).
+// file to change inputs, brightness/contrast presets, mouse switching, or
+// hotkeys — no rebuild required. Any field you omit keeps its C# default
+// (System.Text.Json only overwrites properties actually present in the
+// file), so older config files never break here. Values must match the
+// Mac side's config (see macos/Sources/MonitorSwitcher/main.swift).
 // ============================================================================
 
 internal sealed class HotkeyConfig
@@ -28,10 +31,32 @@ internal sealed class HotkeyConfig
     public string Key { get; set; } = "s";
 }
 
+/// One of the two computers sharing the monitor. InputCode is the VCP 0x60
+/// value of the monitor input that computer is plugged into (VESA defaults:
+/// 15 = DisplayPort-1, 16 = DisplayPort-2, 17 = HDMI-1, 18 = HDMI-2,
+/// 27 = USB-C on many monitors). MouseChannel is that computer's channel on
+/// a multi-host mouse (only used when MouseSwitchEnabled is true).
+internal sealed class MachineConfig
+{
+    public string Name { get; set; } = "";
+    public int InputCode { get; set; }
+    public int MouseChannel { get; set; } = 1;
+}
+
 internal sealed class AppConfig
 {
-    public byte DisplayPortInputCode { get; set; } = 0x0F; // 15 decimal (VESA default: DisplayPort-1)
-    public byte HdmiInputCode { get; set; } = 0x11;         // 17 decimal (VESA default: HDMI-1)
+    /// Exactly two machines. The same list (same order) can be used on both
+    /// computers; only ThisMachine differs.
+    public List<MachineConfig>? Machines { get; set; }
+    /// Index into Machines of the computer this copy of the app runs on.
+    public int? ThisMachine { get; set; }
+
+    // Legacy (pre-"machines") keys — read for migration, never written back.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? DisplayPortInputCode { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? HdmiInputCode { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? MouseDisplayPortChannel { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? MouseHdmiChannel { get; set; }
+
     public HotkeyConfig ToggleHotkey { get; set; } = new HotkeyConfig();
     public HotkeyConfig NightModeHotkey { get; set; } = new HotkeyConfig { Modifiers = new[] { "ctrl", "alt" }, Key = "n" };
     public int DefaultLuminance { get; set; } = 75;
@@ -39,6 +64,47 @@ internal sealed class AppConfig
     public int LuminanceStep { get; set; } = 10;
     public int DefaultContrast { get; set; } = 75;
     public int ContrastStep { get; set; } = 10;
+
+    // Optional companion switch for a Logitech multi-host mouse using the
+    // reverse-engineered HID++ "CHANGE_HOST" feature, via the mx-host-switch
+    // CLI (https://github.com/antonio-castellon/mx-host-switch). Off by
+    // default — Logitech Flow or the mouse's own button can do this instead.
+    // MouseSwitchPath
+    // has no sensible universal default on Windows (the tool ships as a
+    // portable .exe, not something with a fixed install location) — update
+    // it to wherever you put it.
+    public bool MouseSwitchEnabled { get; set; } = false;
+    public string MouseSwitchPath { get; set; } = @"C:\Tools\MXHostSwitch\MXHostSwitch.exe";
+
+    [JsonIgnore] public int LocalIndex => ThisMachine ?? 1;
+    [JsonIgnore] public int RemoteIndex => 1 - LocalIndex;
+    [JsonIgnore] public MachineConfig Local => Machines![LocalIndex];
+    [JsonIgnore] public MachineConfig Remote => Machines![RemoteIndex];
+
+    /// Fills in the two-machine layout. Configs from before "machines"
+    /// existed are migrated: DisplayPort → "Surface" (this PC), HDMI → "Mac".
+    /// The order matches the Mac side (Mac first), so the same machines list
+    /// can be pasted into both configs; only ThisMachine differs.
+    private void Normalize()
+    {
+        if (Machines == null || Machines.Count != 2)
+        {
+            Machines = new List<MachineConfig>
+            {
+                new() { Name = "Mac", InputCode = HdmiInputCode ?? 17, MouseChannel = MouseHdmiChannel ?? 2 },
+                new() { Name = "Surface", InputCode = DisplayPortInputCode ?? 15, MouseChannel = MouseDisplayPortChannel ?? 1 },
+            };
+            ThisMachine = 1;
+        }
+        if (ThisMachine is not (0 or 1)) ThisMachine = 1;
+        DisplayPortInputCode = HdmiInputCode = MouseDisplayPortChannel = MouseHdmiChannel = null;
+    }
+
+    private static readonly JsonSerializerOptions SaveOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase // same key names as the Mac config
+    };
 
     private static string ConfigDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MonitorSwitcher");
@@ -56,7 +122,11 @@ internal sealed class AppConfig
                 var json = File.ReadAllText(ConfigPath);
                 var loaded = JsonSerializer.Deserialize<AppConfig>(json,
                     new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-                if (loaded != null) return loaded;
+                if (loaded != null)
+                {
+                    loaded.Normalize();
+                    return loaded;
+                }
             }
         }
         catch
@@ -65,17 +135,25 @@ internal sealed class AppConfig
         }
 
         var defaults = new AppConfig();
+        defaults.Normalize();
+        defaults.Save();
+        return defaults;
+    }
+
+    /// Persists this config instance back to config.json — used by mouse
+    /// channel calibration so a recalibrated value survives a restart.
+    public void Save()
+    {
         try
         {
             Directory.CreateDirectory(ConfigDir);
-            var json = JsonSerializer.Serialize(defaults, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(this, SaveOptions);
             File.WriteAllText(ConfigPath, json);
         }
         catch
         {
-            // ignore write failure, still usable with in-memory defaults
+            // best-effort only
         }
-        return defaults;
     }
 }
 
@@ -154,13 +232,21 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private readonly AppConfig _config;
     private readonly NotifyIcon _trayIcon;
-    private readonly ToolStripMenuItem _displayPortItem;
-    private readonly ToolStripMenuItem _hdmiItem;
+    /// One "switch to" item per machine, indexed like _config.Machines.
+    private readonly ToolStripMenuItem[] _machineItems;
     private readonly ToolStripMenuItem _nightModeItem;
-    private readonly List<PHYSICAL_MONITOR> _openMonitors = new();
+    private readonly ToolStripMenuItem _mouseChannelLabelItem;
     private readonly HotkeyWindow _hotkeyWindow;
 
-    private byte? _currentInput;
+    private int? _currentInput;
+
+    // Display-presence tracking: when the shared monitor drops out of this
+    // PC's display list the other machine has it; when it comes back, this
+    // PC does. Keeps the tray state right even when the switch was made from
+    // the other computer.
+    private int _lastScreenCount;
+    private readonly System.Windows.Forms.Timer _displayCheckTimer = new() { Interval = 1000 };
+    private SynchronizationContext? _uiContext;
     private int _currentLuminance;
     private int _currentContrast;
     private bool _isNightMode;
@@ -171,22 +257,25 @@ internal sealed class TrayAppContext : ApplicationContext
         _config = AppConfig.Load();
 
         var state = AppState.Load();
-        _currentInput = state.LastInput.HasValue ? (byte)state.LastInput.Value : (byte?)null;
+        _currentInput = state.LastInput;
         _currentLuminance = state.CurrentLuminance ?? _config.DefaultLuminance;
         _currentContrast = state.CurrentContrast ?? _config.DefaultContrast;
         _isNightMode = state.IsNightMode;
         _preNightModeLuminance = state.PreNightModeLuminance ?? _config.DefaultLuminance;
 
-        _displayPortItem = new ToolStripMenuItem("Bring monitor to this Surface (DisplayPort)", null,
-            (_, _) => SwitchInput(_config.DisplayPortInputCode));
-        _hdmiItem = new ToolStripMenuItem("Send monitor to the Mac (HDMI)", null,
-            (_, _) => SwitchInput(_config.HdmiInputCode));
+        _machineItems = _config.Machines!.Select((m, i) =>
+        {
+            int index = i;
+            string title = index == _config.LocalIndex ? $"Bring monitor here ({m.Name})" : $"Show monitor on {m.Name}";
+            return new ToolStripMenuItem(title, null, (_, _) => SwitchInput(index));
+        }).ToArray();
         _nightModeItem = new ToolStripMenuItem($"Night Mode ({HotkeyDisplayString(_config.NightModeHotkey)})", null,
             (_, _) => ToggleNightMode());
+        _mouseChannelLabelItem = new ToolStripMenuItem("Mouse channel: —") { Enabled = false };
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add(_displayPortItem);
-        menu.Items.Add(_hdmiItem);
+        menu.Items.Add(_machineItems[_config.LocalIndex]);
+        menu.Items.Add(_machineItems[_config.RemoteIndex]);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem($"Toggle: {HotkeyDisplayString(_config.ToggleHotkey)}") { Enabled = false });
         menu.Items.Add(new ToolStripMenuItem("Open Config Folder", null, (_, _) => OpenConfigFolder()));
@@ -198,7 +287,21 @@ internal sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(new ToolStripMenuItem("Contrast Up", null, (_, _) => ContrastUp()));
         menu.Items.Add(new ToolStripMenuItem("Contrast Down", null, (_, _) => ContrastDown()));
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(_mouseChannelLabelItem);
+        foreach (int i in new[] { _config.LocalIndex, _config.RemoteIndex })
+        {
+            var machine = _config.Machines![i];
+            menu.Items.Add(new ToolStripMenuItem($"Set Current Channel as {machine.Name}'s Mouse", null,
+                async (_, _) => await CalibrateMouseChannel(v => machine.MouseChannel = v, machine.Name)));
+        }
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
+
+        // Live-refreshes the mouse channel label every time the menu opens —
+        // a genuine hardware read (unlike the monitor's tracked state), so
+        // it's worth re-querying rather than caching. Runs off the UI thread
+        // so opening the menu is never blocked on the subprocess call.
+        menu.Opening += (_, _) => RefreshMouseChannelLabel();
 
         _trayIcon = new NotifyIcon
         {
@@ -219,7 +322,46 @@ internal sealed class TrayAppContext : ApplicationContext
         };
         RegisterHotkey(_config.ToggleHotkey, HOTKEY_ID_TOGGLE);
         RegisterHotkey(_config.NightModeHotkey, HOTKEY_ID_NIGHTMODE);
+
+        _uiContext = SynchronizationContext.Current;
+        _lastScreenCount = Screen.AllScreens.Length;
+        _displayCheckTimer.Tick += (_, _) => { _displayCheckTimer.Stop(); CheckDisplayPresence(); };
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
     }
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        // Can arrive on a SystemEvents thread; hop to the UI thread, then
+        // debounce — displays flicker in and out while a monitor re-syncs.
+        void Restart() { _displayCheckTimer.Stop(); _displayCheckTimer.Start(); }
+        if (_uiContext != null) _uiContext.Post(_ => Restart(), null);
+        else Restart();
+    }
+
+    private void CheckDisplayPresence()
+    {
+        int count = Screen.AllScreens.Length;
+        if (count == _lastScreenCount) return;
+        bool gained = count > _lastScreenCount;
+        _lastScreenCount = count;
+        if (_pendingInput != null) return; // our own switch is in flight; its result sets the state
+        int newInput = gained ? _config.Local.InputCode : _config.Remote.InputCode;
+        if (newInput == _currentInput) return;
+        _currentInput = newInput;
+        PersistState();
+        UpdateChecks();
+    }
+
+    protected override void ExitThreadCore()
+    {
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        _displayCheckTimer.Dispose();
+        _trayIcon.Visible = false;
+        base.ExitThreadCore();
+    }
+
+    private string MachineLabel(int inputCode) =>
+        _config.Machines!.FirstOrDefault(m => m.InputCode == inputCode)?.Name ?? $"input {inputCode}";
 
     private string HotkeyDisplayString(HotkeyConfig hk)
     {
@@ -254,16 +396,30 @@ internal sealed class TrayAppContext : ApplicationContext
         RegisterHotKey(_hotkeyWindow.Handle, id, mods, vk);
     }
 
+    /// Input we've just asked the monitor to switch to but SetVCPFeature
+    /// hasn't confirmed yet. The toggle hotkey reads this first, so pressing
+    /// it twice quickly flips back instead of re-sending the same input.
+    private int? _pendingInput;
+
+    // DDC/CI calls run on background threads; this keeps two of them from
+    // talking to the monitor at the same time.
+    private readonly object _ddcLock = new();
+
     private void ToggleInput()
     {
-        byte target = (_currentInput == _config.DisplayPortInputCode) ? _config.HdmiInputCode : _config.DisplayPortInputCode;
+        int? effective = _pendingInput ?? _currentInput;
+        // Unknown state counts as "here", so the first press sends it away.
+        int target = (effective == _config.Remote.InputCode) ? _config.LocalIndex : _config.RemoteIndex;
         SwitchInput(target);
     }
 
     private void UpdateChecks()
     {
-        _displayPortItem.Checked = _currentInput == _config.DisplayPortInputCode;
-        _hdmiItem.Checked = _currentInput == _config.HdmiInputCode;
+        for (int i = 0; i < _machineItems.Length; i++)
+            _machineItems[i].Checked = _currentInput == _config.Machines![i].InputCode;
+        // Tray tooltip shows who has the monitor (max 63 chars).
+        string text = _currentInput.HasValue ? $"Monitor Switcher — on {MachineLabel(_currentInput.Value)}" : "Monitor Switcher";
+        _trayIcon.Text = text.Length > 63 ? text[..63] : text;
         _nightModeItem.Checked = _isNightMode;
     }
 
@@ -286,145 +442,233 @@ internal sealed class TrayAppContext : ApplicationContext
         });
     }
 
-    private void SwitchInput(byte inputCode)
+    private void SwitchInput(int machineIndex)
     {
-        bool ok = SetVcpFeature(VCP_INPUT, inputCode);
-        if (ok)
+        var machine = _config.Machines![machineIndex];
+        int inputCode = machine.InputCode;
+        _pendingInput = inputCode;
+        RunVcpSet(VCP_INPUT, (uint)inputCode, $"Monitor → {machine.Name}",
+            "No monitor responded to the DDC/CI command. Check that DDC/CI is enabled in the monitor's OSD menu.",
+            onSuccess: () =>
+            {
+                _currentInput = inputCode;
+                // Best-effort companion mouse switch, only after the monitor
+                // switch itself succeeded — never move the mouse to a machine
+                // that doesn't have the picture.
+                SwitchMouseChannel(machine.MouseChannel);
+            },
+            onComplete: () => { if (_pendingInput == inputCode) _pendingInput = null; });
+    }
+
+    /// Sends one VCP write without ever blocking the UI thread. Feedback is
+    /// optimistic: the sound and balloon fire the instant the action is
+    /// triggered, because DDC/CI writes can take a second or more to return
+    /// while the monitor re-syncs. App state (onSuccess, PersistState,
+    /// UpdateChecks) is only updated once the write is confirmed, back on
+    /// the UI thread; on failure the failure feedback replaces the success.
+    private async void RunVcpSet(byte vcpCode, uint value, string successLabel, string failureLabel,
+        Action onSuccess, Action? onComplete = null)
+    {
+        PlayFeedback(success: true, label: successLabel);
+        bool ok = await Task.Run(() => SetVcpFeature(vcpCode, value));
+        try
         {
-            _currentInput = inputCode;
-            PersistState();
-            UpdateChecks();
-            var label = inputCode == _config.DisplayPortInputCode ? "DisplayPort"
-                : (inputCode == _config.HdmiInputCode ? "HDMI" : $"input {inputCode}");
-            PlayFeedback(success: true, label: $"Switched to {label}");
+            if (ok)
+            {
+                onSuccess();
+                PersistState();
+                UpdateChecks();
+            }
+            else
+            {
+                PlayFeedback(success: false, label: failureLabel);
+            }
         }
-        else
+        finally
         {
-            PlayFeedback(success: false,
-                label: "No monitor responded to the DDC/CI command. Check that DDC/CI is enabled in the monitor's OSD menu.");
+            onComplete?.Invoke();
         }
     }
 
-    private void BrightnessUp()
+    /// Shells out to `mx-host-switch --switch N`, entirely on a background
+    /// thread (Bluetooth HID++ round-trips aren't instant). Failures are
+    /// logged, not surfaced — the monitor switch already got its feedback.
+    private void SwitchMouseChannel(int channel)
     {
-        int value = Math.Min(100, _currentLuminance + _config.LuminanceStep);
-        if (SetVcpFeature(VCP_LUMINANCE, (uint)value))
+        if (!_config.MouseSwitchEnabled) return;
+        string path = _config.MouseSwitchPath;
+        _ = Task.Run(() =>
         {
-            _currentLuminance = value;
-            PersistState();
-            PlayFeedback(success: true, label: $"Brightness {value}%");
-        }
-        else
-        {
-            PlayFeedback(success: false, label: "Couldn't change brightness.");
-        }
+            if (!File.Exists(path))
+            {
+                System.Diagnostics.Debug.WriteLine($"MonitorSwitcher: mouse switch tool not found at {path} — skipping");
+                return;
+            }
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = path,
+                    Arguments = $"--switch {channel}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = System.Diagnostics.Process.Start(psi);
+                proc?.WaitForExit(5000);
+                if (proc != null && proc.HasExited && proc.ExitCode != 0)
+                    System.Diagnostics.Debug.WriteLine($"MonitorSwitcher: mouse switch to channel {channel} exited with {proc.ExitCode}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"MonitorSwitcher: couldn't run mouse switch tool: {ex.Message}");
+            }
+        });
     }
 
-    private void BrightnessDown()
+    /// Runs `mx-host-switch --list` and pulls the mouse's *actual current*
+    /// channel out of its output (a line containing `current=Channel N/M`).
+    /// This is a genuine live read from the mouse, not app-tracked state.
+    /// Returns null if switching is disabled, the tool is missing, or
+    /// nothing was detected (e.g. the mouse isn't connected to this PC).
+    private int? QueryCurrentMouseChannel()
     {
-        int value = Math.Max(0, _currentLuminance - _config.LuminanceStep);
-        if (SetVcpFeature(VCP_LUMINANCE, (uint)value))
+        if (!_config.MouseSwitchEnabled || !File.Exists(_config.MouseSwitchPath)) return null;
+        try
         {
-            _currentLuminance = value;
-            PersistState();
-            PlayFeedback(success: true, label: $"Brightness {value}%");
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = _config.MouseSwitchPath,
+                Arguments = "--list",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return null;
+            string output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(5000);
+            var match = Regex.Match(output, @"current=Channel (\d+)");
+            if (match.Success && int.TryParse(match.Groups[1].Value, out int channel)) return channel;
         }
-        else
+        catch (Exception ex)
         {
-            PlayFeedback(success: false, label: "Couldn't change brightness.");
+            System.Diagnostics.Debug.WriteLine($"MonitorSwitcher: couldn't query mouse channel: {ex.Message}");
         }
+        return null;
     }
 
-    private void ContrastUp()
+    /// Updates the label without blocking the menu's appearance — shows
+    /// "checking…" immediately, then fills in the real value once the
+    /// subprocess (running on a background thread) returns.
+    private async void RefreshMouseChannelLabel()
     {
-        int value = Math.Min(100, _currentContrast + _config.ContrastStep);
-        if (SetVcpFeature(VCP_CONTRAST, (uint)value))
+        if (!_config.MouseSwitchEnabled)
         {
-            _currentContrast = value;
-            PersistState();
-            PlayFeedback(success: true, label: $"Contrast {value}");
+            _mouseChannelLabelItem.Text = "Mouse switching: disabled in config";
+            return;
         }
-        else
-        {
-            PlayFeedback(success: false, label: "Couldn't change contrast.");
-        }
+        _mouseChannelLabelItem.Text = "Mouse channel: checking…";
+        int? channel = await Task.Run(() => QueryCurrentMouseChannel());
+        _mouseChannelLabelItem.Text = channel.HasValue
+            ? $"Mouse channel right now: {channel.Value}"
+            : "Mouse channel: not detected";
     }
 
-    private void ContrastDown()
+    /// One-click recalibration: whichever channel the mouse is actually on
+    /// right now becomes the saved value for that role, written back to
+    /// config.json immediately. Use any time a re-pair shifts which channel
+    /// belongs to which computer — switch the mouse to that machine first,
+    /// then click the matching item.
+    private async Task CalibrateMouseChannel(Action<int> setter, string roleName)
     {
-        int value = Math.Max(0, _currentContrast - _config.ContrastStep);
-        if (SetVcpFeature(VCP_CONTRAST, (uint)value))
+        int? channel = await Task.Run(() => QueryCurrentMouseChannel());
+        if (channel == null)
         {
-            _currentContrast = value;
-            PersistState();
-            PlayFeedback(success: true, label: $"Contrast {value}");
+            string reason = _config.MouseSwitchEnabled
+                ? "Make sure the mouse is connected to this PC right now, and that MouseSwitchPath in config.json points to a working mx-host-switch executable."
+                : "Mouse switching is disabled (MouseSwitchEnabled: false in config.json).";
+            MessageBox.Show($"Couldn't read the mouse's current channel.\n\n{reason}", "Monitor Switcher",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
         }
-        else
-        {
-            PlayFeedback(success: false, label: "Couldn't change contrast.");
-        }
+        setter(channel.Value);
+        _config.Save();
+        PlayFeedback(success: true, label: $"{roleName} mouse = Ch {channel.Value}");
     }
+
+    private void BrightnessUp() => SetLuminance(Math.Min(100, _currentLuminance + _config.LuminanceStep));
+
+    private void BrightnessDown() => SetLuminance(Math.Max(0, _currentLuminance - _config.LuminanceStep));
+
+    private void SetLuminance(int value) =>
+        RunVcpSet(VCP_LUMINANCE, (uint)value, $"Brightness {value}%", "Couldn't change brightness.",
+            onSuccess: () => _currentLuminance = value);
+
+    private void ContrastUp() => SetContrast(Math.Min(100, _currentContrast + _config.ContrastStep));
+
+    private void ContrastDown() => SetContrast(Math.Max(0, _currentContrast - _config.ContrastStep));
+
+    private void SetContrast(int value) =>
+        RunVcpSet(VCP_CONTRAST, (uint)value, $"Contrast {value}", "Couldn't change contrast.",
+            onSuccess: () => _currentContrast = value);
 
     private void ToggleNightMode()
     {
         if (_isNightMode)
         {
             int restore = _preNightModeLuminance;
-            if (SetVcpFeature(VCP_LUMINANCE, (uint)restore))
-            {
-                _currentLuminance = restore;
-                _isNightMode = false;
-                PersistState();
-                UpdateChecks();
-                PlayFeedback(success: true, label: $"Brightness {restore}%");
-            }
-            else
-            {
-                PlayFeedback(success: false, label: "Couldn't leave Night Mode.");
-            }
+            RunVcpSet(VCP_LUMINANCE, (uint)restore, $"Brightness {restore}%", "Couldn't leave Night Mode.",
+                onSuccess: () =>
+                {
+                    _currentLuminance = restore;
+                    _isNightMode = false;
+                });
         }
         else
         {
             int toRestore = _currentLuminance;
-            if (SetVcpFeature(VCP_LUMINANCE, (uint)_config.NightModeLuminance))
-            {
-                _preNightModeLuminance = toRestore;
-                _currentLuminance = _config.NightModeLuminance;
-                _isNightMode = true;
-                PersistState();
-                UpdateChecks();
-                PlayFeedback(success: true, label: "Night Mode");
-            }
-            else
-            {
-                PlayFeedback(success: false, label: "Couldn't enter Night Mode.");
-            }
+            int night = _config.NightModeLuminance;
+            RunVcpSet(VCP_LUMINANCE, (uint)night, "Night Mode", "Couldn't enter Night Mode.",
+                onSuccess: () =>
+                {
+                    _preNightModeLuminance = toRestore;
+                    _currentLuminance = night;
+                    _isNightMode = true;
+                });
         }
     }
 
+    /// Runs on a background thread (see RunVcpSet). Monitor handles are
+    /// local to each call and the whole thing is serialized by _ddcLock, so
+    /// overlapping actions can't release each other's handles. No dialogs
+    /// here — the caller shows failure feedback on the UI thread.
     private bool SetVcpFeature(byte vcpCode, uint value)
     {
-        bool anySucceeded = false;
-        try
+        lock (_ddcLock)
         {
-            foreach (var handle in GetPhysicalMonitorHandles())
+            bool anySucceeded = false;
+            var monitors = new List<PHYSICAL_MONITOR>();
+            try
             {
-                if (Dxva2.SetVCPFeature(handle, vcpCode, value))
+                foreach (var m in GetPhysicalMonitors(monitors))
                 {
-                    anySucceeded = true;
+                    if (Dxva2.SetVCPFeature(m.hPhysicalMonitor, vcpCode, value))
+                    {
+                        anySucceeded = true;
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"MonitorSwitcher: DDC/CI command failed: {ex.Message}");
+            }
+            finally
+            {
+                if (monitors.Count > 0)
+                    Dxva2.DestroyPhysicalMonitors((uint)monitors.Count, monitors.ToArray());
+            }
+            return anySucceeded;
         }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"Couldn't send the DDC/CI command:\n{ex.Message}", "Monitor Switcher",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-        finally
-        {
-            ReleaseAllPhysicalMonitors();
-        }
-        return anySucceeded;
     }
 
     private void PlayFeedback(bool success, string label)
@@ -441,10 +685,8 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private List<IntPtr> GetPhysicalMonitorHandles()
+    private static List<PHYSICAL_MONITOR> GetPhysicalMonitors(List<PHYSICAL_MONITOR> into)
     {
-        var handles = new List<IntPtr>();
-
         User32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
             (IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data) =>
             {
@@ -453,26 +695,13 @@ internal sealed class TrayAppContext : ApplicationContext
                     var monitors = new PHYSICAL_MONITOR[count];
                     if (Dxva2.GetPhysicalMonitorsFromHMONITOR(hMonitor, count, monitors))
                     {
-                        foreach (var m in monitors)
-                        {
-                            handles.Add(m.hPhysicalMonitor);
-                            _openMonitors.Add(m);
-                        }
+                        into.AddRange(monitors);
                     }
                 }
                 return true;
             }, IntPtr.Zero);
 
-        return handles;
-    }
-
-    private void ReleaseAllPhysicalMonitors()
-    {
-        if (_openMonitors.Count > 0)
-        {
-            Dxva2.DestroyPhysicalMonitors((uint)_openMonitors.Count, _openMonitors.ToArray());
-            _openMonitors.Clear();
-        }
+        return into;
     }
 
     [DllImport("user32.dll")]
