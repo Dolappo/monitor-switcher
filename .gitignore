@@ -14,3 +14,13 @@ publish/
 # stray editor backups
 *.bak
 *.tmp
+
+# Windows publish output
+dist/
+
+*.bak
+*.app/
+.build/
+bin/
+obj/
+dist/
